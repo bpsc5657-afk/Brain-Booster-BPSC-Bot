@@ -1979,15 +1979,3 @@ def register_handlers(
         ),
         group=2,
     )
-
-    # -----------------------------------------------------
-    # UNKNOWN COMMAND
-    # -----------------------------------------------------
-
-    application.add_handler(
-        MessageHandler(
-             filters.COMMAND,
-             unknown_command,
-        ),
-        group=3,
-    )
