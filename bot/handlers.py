@@ -3811,3 +3811,10 @@ async def initialize_quiz_system(
         "Quiz system initialized. Commands: %d",
         len(BOT_COMMANDS),
     )
+    application.add_handler(
+    MessageHandler(
+            filters.COMMAND,
+              unknown_command,
+         ),
+        group=0,
+    )
