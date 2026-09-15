@@ -1981,13 +1981,13 @@ def register_handlers(
     )
 
     # -----------------------------------------------------
-    # UNKNOWN COMMAND
-    # -----------------------------------------------------
+# UNKNOWN COMMAND
+# -----------------------------------------------------
 
-    application.add_handler(
-       MessageHandler(
-           filters.COMMAND,
-              unknown_command,
-       ),       
-       group=3,
-    )
+application.add_handler(
+    MessageHandler(
+        filters.COMMAND,
+        unknown_command,
+    ),
+    group=3,
+)
