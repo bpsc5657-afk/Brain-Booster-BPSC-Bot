@@ -1,94 +1,14 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Brain Booster BPSC Quiz - handlers.py</title>
-
-<style>
-    body {
-        margin: 0;
-        background: #111827;
-        color: #f9fafb;
-        font-family: Arial, sans-serif;
-    }
-
-    .container {
-        max-width: 1000px;
-        margin: 20px auto;
-        padding: 20px;
-    }
-
-    h1 {
-        font-size: 24px;
-    }
-
-    button {
-        background: #2563eb;
-        color: white;
-        border: 0;
-        padding: 12px 18px;
-        border-radius: 8px;
-        cursor: pointer;
-        font-size: 15px;
-        margin-bottom: 12px;
-    }
-
-    button:hover {
-        background: #1d4ed8;
-    }
-
-    textarea {
-        width: 100%;
-        height: 80vh;
-        box-sizing: border-box;
-        background: #020617;
-        color: #e5e7eb;
-        border: 1px solid #374151;
-        border-radius: 10px;
-        padding: 15px;
-        font-family: monospace;
-        font-size: 13px;
-        line-height: 1.5;
-        resize: vertical;
-    }
-
-    .note {
-        background: #1f2937;
-        padding: 15px;
-        border-radius: 10px;
-        margin-bottom: 15px;
-        line-height: 1.6;
-    }
-</style>
-</head>
-
-<body>
-
-<div class="container">
-
-<h1>Brain Booster BPSC Quiz — handlers.py</h1>
-
-<div class="note">
-    पूरा code नीचे है।<br>
-    <b>Copy handlers.py</b> दबाएँ → GitHub में
-    <b>bot/handlers.py</b> खोलें → पूरा पुराना code हटाएँ →
-    यह code paste करें → Commit करें।
-</div>
-
-<button onclick="copyCode()">📋 Copy handlers.py</button>
-
-<textarea id="code" spellcheck="false">
 """Professional Telegram Quiz Creator Bot handlers."""
 
+import asyncio
 import csv
 import io
 import json
 import logging
 import re
 from html import escape
-from urllib.request import Request, urlopen
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from telegram import (
     InlineKeyboardButton,
@@ -113,15 +33,15 @@ logger = logging.getLogger(__name__)
 DB_KEY = "db"
 REDIS_KEY = "redis"
 
-
 # =========================================================
-# COMMAND MENU
+# TELEGRAM COMMANDS
+# EXACTLY THESE COMMANDS ARE EXPOSED
 # =========================================================
 
 BOT_COMMANDS = (
-    ("start", "Start the bot and show welcome message"),
+    ("start", "Start the bot"),
     ("create", "Create a new quiz"),
-    ("myquizzes", "View quizzes created by you"),
+    ("myquizzes", "View your quizzes"),
     ("settings", "Configure quiz settings"),
     ("stop", "Stop the current quiz"),
     ("help", "Show all commands"),
@@ -133,37 +53,29 @@ BOT_COMMANDS = (
     ("fast", "Decrease question timer"),
     ("slow", "Increase question timer"),
     ("stoppoll", "Stop an active poll"),
-    ("testbook", "Import an attempted quiz from Testbook URL"),
-    ("tutorial", "Show bot tutorials and guides"),
-    ("cancel", "Cancel current creation or editing process"),
+    ("testbook", "Import quiz from Testbook URL"),
+    ("tutorial", "Show tutorials and guides"),
+    ("cancel", "Cancel current process"),
 )
 
-
 # =========================================================
-# STATES
+# USER STATES
 # =========================================================
 
 STATE_TITLE = "title"
 STATE_SUBJECT = "subject"
 STATE_TIME = "time"
 STATE_NEGATIVE = "negative"
-STATE_BATCH = "batch"
+STATE_BATCH = "batch_questions"
 STATE_COMPLETE = "complete"
-STATE_SECTION_TITLE = "section_title"
-STATE_SECTION_TIME = "section_time"
-STATE_SECTION_QUESTIONS = "section_questions"
 
+DRAFTS: dict[int, dict] = {}
 
-# =========================================================
-# IN-MEMORY USER SESSIONS
-# =========================================================
-
-DRAFTS = {}
-QUIZ_SESSIONS = {}
-
+# Active quiz/session state
+USER_SESSIONS: dict[int, dict] = {}
 
 # =========================================================
-# DATABASE
+# DATABASE SCHEMA
 # =========================================================
 
 CREATE_QUIZZES_TABLE = """
@@ -175,8 +87,6 @@ CREATE TABLE IF NOT EXISTS quizzes (
     question_count INTEGER NOT NULL DEFAULT 0,
     time_limit INTEGER NOT NULL DEFAULT 30,
     negative_marking DOUBLE PRECISION NOT NULL DEFAULT 0,
-    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
-    sections JSONB NOT NULL DEFAULT '[]'::jsonb,
     published BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -186,7 +96,8 @@ CREATE_QUESTIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS quiz_questions (
     id SERIAL PRIMARY KEY,
     quiz_id INTEGER NOT NULL
-        REFERENCES quizzes(id) ON DELETE CASCADE,
+        REFERENCES quizzes(id)
+        ON DELETE CASCADE,
     question_no INTEGER NOT NULL,
     question TEXT NOT NULL,
     option_a TEXT NOT NULL,
@@ -194,47 +105,159 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
     option_c TEXT NOT NULL,
     option_d TEXT NOT NULL,
     correct_answer TEXT NOT NULL,
-    explanation TEXT DEFAULT '',
+    explanation TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+CREATE_BOOKMARKS_TABLE = """
+CREATE TABLE IF NOT EXISTS quiz_bookmarks (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    question_id INTEGER NOT NULL
+        REFERENCES quiz_questions(id)
+        ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(user_id, question_id)
+);
+"""
+
+CREATE_ANSWERS_TABLE = """
+CREATE TABLE IF NOT EXISTS quiz_answers (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    quiz_id INTEGER NOT NULL
+        REFERENCES quizzes(id)
+        ON DELETE CASCADE,
+    question_id INTEGER NOT NULL
+        REFERENCES quiz_questions(id)
+        ON DELETE CASCADE,
+    selected_answer TEXT,
+    is_correct BOOLEAN NOT NULL DEFAULT FALSE,
+    answered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+CREATE_SECTIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS quiz_sections (
+    id SERIAL PRIMARY KEY,
+    quiz_id INTEGER NOT NULL
+        REFERENCES quizzes(id)
+        ON DELETE CASCADE,
+    section_no INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    time_limit INTEGER NOT NULL DEFAULT 10,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 
 
-async def ensure_quiz_tables(pool):
+async def ensure_quiz_tables(pool) -> None:
+    """Create required tables if they don't exist."""
+
     if pool is None:
         return
 
     async with pool.acquire() as conn:
         await conn.execute(CREATE_QUIZZES_TABLE)
         await conn.execute(CREATE_QUESTIONS_TABLE)
+        await conn.execute(CREATE_BOOKMARKS_TABLE)
+        await conn.execute(CREATE_ANSWERS_TABLE)
+        await conn.execute(CREATE_SECTIONS_TABLE)
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def get_user_id(update: Update) -> int | None:
+    user = update.effective_user
+    return user.id if user else None
+
+
+def get_message(update: Update):
+    return update.effective_message
+
+
+def get_pool(context: ContextTypes.DEFAULT_TYPE):
+    return context.bot_data.get(DB_KEY)
+
+
+def quiz_creation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "👁 Preview",
+                    callback_data="draft_preview",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "💾 Save Quiz",
+                    callback_data="draft_save",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="draft_cancel",
+                ),
+            ],
+        ]
+    )
+
+
+def edit_keyboard(quiz_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✏️ Edit Questions",
+                    callback_data=f"edit_questions:{quiz_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👁 Preview",
+                    callback_data=f"stored_preview:{quiz_id}",
+                )
+            ],
+        ]
+    )
 
 
 # =========================================================
 # START
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
 
-    if not user or not message:
+    message = get_message(update)
+    user = update.effective_user
+
+    if not message or not user:
         return
 
-    pool = context.bot_data.get(DB_KEY)
+    pool = get_pool(context)
 
-    if pool:
+    if pool is not None:
         await db.upsert_user(
             pool,
             user.id,
             user.username,
             user.first_name,
         )
-
         await ensure_quiz_tables(pool)
+
+    name = escape(user.first_name or "User")
 
     keyboard = ReplyKeyboardMarkup(
         [
-            ["📝 Create Quiz", "📚 My Quizzes"],
+            ["➕ Create Quiz", "📚 My Quizzes"],
             ["⚙️ Settings", "📖 Tutorial"],
         ],
         resize_keyboard=True,
@@ -243,11 +266,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await message.reply_text(
-        f"Welcome to <b>Brain Booster BPSC Quiz Bot</b>, "
-        f"{escape(user.first_name or 'User')}!\n\n"
+        f"<b>Welcome to Brain Booster BPSC Quiz Bot, {name}!</b>\n\n"
         "Create, manage and attempt professional quizzes "
         "from one place.\n\n"
-        "Use <b>/create</b> to create a quiz.",
+        "➕ /create — Create a quiz\n"
+        "📚 /myquizzes — Your quizzes\n"
+        "📖 /help — All commands",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
@@ -257,42 +281,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HELP
 # =========================================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    message = get_message(update)
 
     if not message:
         return
 
     text = """
-<b>🧠 PROFESSIONAL QUIZ BOT</b>
+<b>🎯 Professional Quiz Creator Bot</b>
 
 <b>Quiz Creation</b>
+
 /create — Create a new quiz
 /myquizzes — View your quizzes
 /settings — Configure quiz settings
-/section — Create timed sections
+/section — Create timed quiz sections
 /cancel — Cancel current process
 
 <b>Quiz Control</b>
+
 /stop — Stop current quiz
 /pause — Pause current quiz
-/resume — Resume quiz
+/resume — Resume paused quiz
 /fast — Decrease question timer
 /slow — Increase question timer
 /stoppoll — Stop active poll
 
 <b>Review</b>
+
 /mistakes — Review incorrect answers
 /bookmarks — Review bookmarked questions
 
-<b>Import & Help</b>
-/testbook — Import attempted Testbook quiz
-/tutorial — Tutorials and guides
-/help — Show commands
-/start — Start bot
+<b>Import & Learning</b>
 
-<b>Subjects are metadata only.</b>
-They are not Telegram commands.
+/testbook — Import quiz from Testbook URL
+/tutorial — Tutorials and guides
+
+<b>General</b>
+
+/start — Start bot
+/help — Show all commands
 """
 
     await message.reply_text(
@@ -305,34 +337,34 @@ They are not Telegram commands.
 # TUTORIAL
 # =========================================================
 
-async def tutorial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
+async def tutorial(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    message = get_message(update)
 
     if not message:
         return
 
     text = """
-<b>📖 QUIZ CREATOR TUTORIAL</b>
+<b>📖 Quiz Creator Tutorial</b>
 
-<b>Step 1</b>
-/create भेजें.
+<b>1. Create Quiz</b>
 
-<b>Step 2</b>
-Quiz title दें.
+Send:
 
-<b>Step 3</b>
-Subject दें या <code>skip</code> लिखें.
+<code>/create</code>
 
-<b>Step 4</b>
-Time limit दें.
+Then enter:
 
-<b>Step 5</b>
-Negative marking दें.
+• Quiz title
+• Optional subject
+• Time limit
+• Negative marking
+• All questions in one message
 
-<b>Step 6</b>
-अब सारे questions एक ही message में भेजें.
-
-<b>Format:</b>
+<b>2. Batch Question Format</b>
 
 <code>
 Q1. भारत की राजधानी क्या है?
@@ -352,16 +384,26 @@ Correct: B
 Explanation: पटना बिहार की राजधानी है.
 </code>
 
-आप 1 से 500 तक questions एक batch में भेज सकते हैं।
+<b>3. Save</b>
 
-File भी upload कर सकते हैं।
-Supported:
-TXT
-CSV
-JSON
+Questions parse होने के बाद:
 
-इसके बाद:
-Preview → Save Quiz
+👁 Preview
+
+या
+
+💾 Save Quiz
+
+<b>4. Manage</b>
+
+<code>/myquizzes</code>
+
+से अपने quizzes देखें।
+
+<b>5. Publish</b>
+
+Quiz save होने के बाद bot Quiz ID देगा।
+उस ID से publish किया जा सकता है।
 """
 
     await message.reply_text(
@@ -371,87 +413,16 @@ Preview → Save Quiz
 
 
 # =========================================================
-# SETTINGS
-# =========================================================
-
-def default_settings():
-    return {
-        "question_timer": 30,
-        "show_explanation": True,
-        "shuffle_questions": False,
-        "shuffle_options": False,
-        "allow_back": True,
-        "show_score": True,
-    }
-
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
-
-    if not user or not message:
-        return
-
-    session = QUIZ_SESSIONS.setdefault(
-        user.id,
-        {
-            "settings": default_settings(),
-            "running": False,
-            "paused": False,
-            "poll_active": False,
-            "current_question": 0,
-        },
-    )
-
-    s = session["settings"]
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"⏱ Timer: {s['question_timer']} sec",
-                    callback_data="setting_timer",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"💡 Explanation: "
-                    f"{'ON' if s['show_explanation'] else 'OFF'}",
-                    callback_data="setting_explanation",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"🔀 Shuffle Questions: "
-                    f"{'ON' if s['shuffle_questions'] else 'OFF'}",
-                    callback_data="setting_shuffle_q",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"🔀 Shuffle Options: "
-                    f"{'ON' if s['shuffle_options'] else 'OFF'}",
-                    callback_data="setting_shuffle_o",
-                )
-            ],
-        ]
-    )
-
-    await message.reply_text(
-        "<b>⚙️ Quiz Settings</b>\n\n"
-        "यह settings आपके current quiz session पर लागू होंगी.",
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
-
-
-# =========================================================
 # CREATE QUIZ
 # =========================================================
 
-async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def create_quiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
@@ -465,14 +436,13 @@ async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "negative_marking": 0,
         "questions": [],
         "sections": [],
-        "settings": default_settings(),
     }
 
     await message.reply_text(
         "<b>📝 CREATE NEW QUIZ</b>\n\n"
         "Quiz का title भेजें.\n\n"
-        "इसके बाद basic settings लेने के बाद "
-        "आप सारे questions <b>एक ही message</b> में भेज सकेंगे.\n\n"
+        "Example:\n"
+        "<code>BPSC General Studies Mock Test 01</code>\n\n"
         "❌ रोकने के लिए /cancel",
         parse_mode="HTML",
     )
@@ -482,11 +452,32 @@ async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # BATCH QUESTION PARSER
 # =========================================================
 
-def parse_batch_questions(text: str):
-    text = text.replace("\r\n", "\n").strip()
+def parse_batch_questions(text: str) -> tuple[list[dict], list[str]]:
+    """
+    Parse multiple questions from one text block.
+
+    Supported:
+
+    Q1. Question
+    A. Option A
+    B. Option B
+    C. Option C
+    D. Option D
+    Correct: B
+    Explanation: Explanation
+
+    Also supports:
+    Question 1:
+    Answer: B
+    Correct Answer: B
+    """
+
+    text = text.replace("\r\n", "\n")
+    text = text.replace("\r", "\n")
+    text = text.strip()
 
     if not text:
-        return []
+        return [], ["Empty input"]
 
     blocks = re.split(
         r"(?im)(?=^\s*(?:Q(?:uestion)?\s*\d+\s*[\.\):\-]))",
@@ -494,8 +485,10 @@ def parse_batch_questions(text: str):
     )
 
     questions = []
+    errors = []
 
-    for block in blocks:
+    for block_number, block in enumerate(blocks, start=1):
+
         block = block.strip()
 
         if not block:
@@ -519,16 +512,46 @@ def parse_batch_questions(text: str):
 
         question = lines[0]
 
+        question = re.sub(
+            r"(?i)^question\s*:\s*",
+            "",
+            question,
+        ).strip()
+
         option_a = None
         option_b = None
         option_c = None
         option_d = None
         correct = None
-        explanation = ""
+        explanation_parts = []
 
-        explanation_mode = False
+        reading_explanation = False
 
         for line in lines[1:]:
+
+            # ---------------------------------------------
+            # EXPLANATION
+            # ---------------------------------------------
+
+            match = re.match(
+                r"(?i)^explanation\s*:\s*(.*)$",
+                line,
+            )
+
+            if match:
+                explanation_parts.append(
+                    match.group(1).strip()
+                )
+                reading_explanation = True
+                continue
+
+            if reading_explanation:
+                explanation_parts.append(line)
+                continue
+
+            # ---------------------------------------------
+            # OPTIONS
+            # ---------------------------------------------
 
             match = re.match(
                 r"^([ABCD])\s*[\.\):\-]\s*(.+)$",
@@ -537,6 +560,7 @@ def parse_batch_questions(text: str):
             )
 
             if match:
+
                 letter = match.group(1).upper()
                 value = match.group(2).strip()
 
@@ -549,8 +573,11 @@ def parse_batch_questions(text: str):
                 elif letter == "D":
                     option_d = value
 
-                explanation_mode = False
                 continue
+
+            # ---------------------------------------------
+            # CORRECT ANSWER
+            # ---------------------------------------------
 
             match = re.match(
                 r"(?i)^(?:correct\s*answer|correct|answer)"
@@ -560,214 +587,373 @@ def parse_batch_questions(text: str):
 
             if match:
                 correct = match.group(1).upper()
-                explanation_mode = False
                 continue
 
-            if re.match(
-                r"(?i)^explanation\s*:",
-                line,
-            ):
-                explanation = re.sub(
-                    r"(?i)^explanation\s*:\s*",
-                    "",
-                    line,
-                ).strip()
+        missing = []
 
-                explanation_mode = True
-                continue
+        if not question:
+            missing.append("question")
 
-            if explanation_mode:
-                explanation += " " + line
+        if not option_a:
+            missing.append("A")
 
-        if all(
-            [
-                question,
-                option_a,
-                option_b,
-                option_c,
-                option_d,
-                correct,
-            ]
-        ):
-            questions.append(
-                {
-                    "question": question,
-                    "option_a": option_a,
-                    "option_b": option_b,
-                    "option_c": option_c,
-                    "option_d": option_d,
-                    "correct_answer": correct,
-                    "explanation": explanation.strip(),
-                }
+        if not option_b:
+            missing.append("B")
+
+        if not option_c:
+            missing.append("C")
+
+        if not option_d:
+            missing.append("D")
+
+        if not correct:
+            missing.append("correct answer")
+
+        if missing:
+
+            errors.append(
+                f"Question block {block_number}: "
+                f"missing {', '.join(missing)}"
             )
+            continue
 
-    return questions
+        questions.append(
+            {
+                "question": question,
+                "option_a": option_a,
+                "option_b": option_b,
+                "option_c": option_c,
+                "option_d": option_d,
+                "correct_answer": correct,
+                "explanation": " ".join(
+                    explanation_parts
+                ).strip(),
+            }
+        )
+
+    return questions, errors
 
 
 # =========================================================
 # FILE PARSERS
 # =========================================================
 
-def parse_json_questions(text: str):
-    data = json.loads(text)
+def parse_json_questions(text: str) -> tuple[list[dict], list[str]]:
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return [], [f"Invalid JSON: {exc}"]
 
     if isinstance(data, dict):
-        data = data.get(
-            "questions",
-            data.get("data", []),
-        )
+        data = data.get("questions", [])
 
-    result = []
+    if not isinstance(data, list):
+        return [], ["JSON must contain a questions list."]
 
-    for item in data:
+    questions = []
+    errors = []
+
+    for index, item in enumerate(data, start=1):
+
         if not isinstance(item, dict):
+            errors.append(
+                f"Question {index}: object expected."
+            )
             continue
 
         question = str(
             item.get("question", "")
         ).strip()
 
-        options = item.get("options", {})
+        options = item.get("options")
 
-        if isinstance(options, list):
-            options = {
-                "A": options[0] if len(options) > 0 else "",
-                "B": options[1] if len(options) > 1 else "",
-                "C": options[2] if len(options) > 2 else "",
-                "D": options[3] if len(options) > 3 else "",
-            }
+        if isinstance(options, dict):
+
+            option_a = str(
+                options.get("A", "")
+            ).strip()
+
+            option_b = str(
+                options.get("B", "")
+            ).strip()
+
+            option_c = str(
+                options.get("C", "")
+            ).strip()
+
+            option_d = str(
+                options.get("D", "")
+            ).strip()
+
+        else:
+
+            option_a = str(
+                item.get("option_a", "")
+            ).strip()
+
+            option_b = str(
+                item.get("option_b", "")
+            ).strip()
+
+            option_c = str(
+                item.get("option_c", "")
+            ).strip()
+
+            option_d = str(
+                item.get("option_d", "")
+            ).strip()
 
         correct = str(
             item.get(
                 "correct_answer",
-                item.get("correct", ""),
+                item.get("answer", ""),
             )
         ).strip().upper()
 
-        if correct.startswith("OPTION "):
-            correct = correct[-1:]
+        explanation = str(
+            item.get("explanation", "")
+        ).strip()
 
-        q = {
-            "question": question,
-            "option_a": str(options.get("A", "")).strip(),
-            "option_b": str(options.get("B", "")).strip(),
-            "option_c": str(options.get("C", "")).strip(),
-            "option_d": str(options.get("D", "")).strip(),
-            "correct_answer": correct,
-            "explanation": str(
-                item.get("explanation", "")
-            ).strip(),
-        }
-
-        if (
-            q["question"]
-            and q["option_a"]
-            and q["option_b"]
-            and q["option_c"]
-            and q["option_d"]
-            and correct in {"A", "B", "C", "D"}
+        if not all(
+            [
+                question,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct in {"A", "B", "C", "D"},
+            ]
         ):
-            result.append(q)
+            errors.append(
+                f"Question {index}: invalid or incomplete."
+            )
+            continue
 
-    return result
+        questions.append(
+            {
+                "question": question,
+                "option_a": option_a,
+                "option_b": option_b,
+                "option_c": option_c,
+                "option_d": option_d,
+                "correct_answer": correct,
+                "explanation": explanation,
+            }
+        )
+
+    return questions, errors
 
 
-def parse_csv_questions(text: str):
-    result = []
+def parse_csv_questions(text: str) -> tuple[list[dict], list[str]]:
 
     reader = csv.DictReader(
         io.StringIO(text)
     )
 
-    for row in reader:
+    questions = []
+    errors = []
 
-        q = {
-            "question": (
-                row.get("question")
-                or row.get("Question")
-                or ""
-            ).strip(),
+    for index, row in enumerate(reader, start=1):
 
-            "option_a": (
-                row.get("option_a")
-                or row.get("A")
-                or ""
-            ).strip(),
+        def value(*keys):
+            for key in keys:
+                if key in row and row[key]:
+                    return row[key].strip()
+            return ""
 
-            "option_b": (
-                row.get("option_b")
-                or row.get("B")
-                or ""
-            ).strip(),
+        question = value("question", "Question")
+        option_a = value("option_a", "A", "a")
+        option_b = value("option_b", "B", "b")
+        option_c = value("option_c", "C", "c")
+        option_d = value("option_d", "D", "d")
+        correct = value(
+            "correct_answer",
+            "correct",
+            "answer",
+        ).upper()
 
-            "option_c": (
-                row.get("option_c")
-                or row.get("C")
-                or ""
-            ).strip(),
+        explanation = value(
+            "explanation",
+            "Explanation",
+        )
 
-            "option_d": (
-                row.get("option_d")
-                or row.get("D")
-                or ""
-            ).strip(),
+        if not all(
+            [
+                question,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct in {"A", "B", "C", "D"},
+            ]
+        ):
+            errors.append(
+                f"CSV row {index}: incomplete."
+            )
+            continue
 
-            "correct_answer": (
-                row.get("correct_answer")
-                or row.get("correct")
-                or row.get("Correct")
-                or ""
-            ).strip().upper(),
+        questions.append(
+            {
+                "question": question,
+                "option_a": option_a,
+                "option_b": option_b,
+                "option_c": option_c,
+                "option_d": option_d,
+                "correct_answer": correct,
+                "explanation": explanation,
+            }
+        )
 
-            "explanation": (
-                row.get("explanation")
-                or row.get("Explanation")
-                or ""
-            ).strip(),
-        }
-
-        if q["correct_answer"] in {"A", "B", "C", "D"}:
-            if all(
-                [
-                    q["question"],
-                    q["option_a"],
-                    q["option_b"],
-                    q["option_c"],
-                    q["option_d"],
-                ]
-            ):
-                result.append(q)
-
-    return result
-
-
-def parse_file_questions(filename: str, content: bytes):
-    lower = filename.lower()
-
-    text = content.decode(
-        "utf-8",
-        errors="replace",
-    )
-
-    if lower.endswith(".json"):
-        return parse_json_questions(text)
-
-    if lower.endswith(".csv"):
-        return parse_csv_questions(text)
-
-    return parse_batch_questions(text)
+    return questions, errors
 
 
 # =========================================================
-# CREATION TEXT PROCESSOR
+# SAVE DRAFT TO DATABASE
+# =========================================================
+
+async def save_draft_to_database(
+    draft: dict,
+    user_id: int,
+    pool,
+) -> int:
+
+    await ensure_quiz_tables(pool)
+
+    async with pool.acquire() as conn:
+
+        async with conn.transaction():
+
+            quiz_id = await conn.fetchval(
+                """
+                INSERT INTO quizzes
+                (
+                    creator_id,
+                    title,
+                    subject,
+                    question_count,
+                    time_limit,
+                    negative_marking,
+                    published
+                )
+                VALUES
+                ($1,$2,$3,$4,$5,$6,FALSE)
+                RETURNING id;
+                """,
+                user_id,
+                draft["title"],
+                draft["subject"] or None,
+                len(draft["questions"]),
+                draft["time_limit"],
+                draft["negative_marking"],
+            )
+
+            for number, question in enumerate(
+                draft["questions"],
+                start=1,
+            ):
+
+                await conn.execute(
+                    """
+                    INSERT INTO quiz_questions
+                    (
+                        quiz_id,
+                        question_no,
+                        question,
+                        option_a,
+                        option_b,
+                        option_c,
+                        option_d,
+                        correct_answer,
+                        explanation
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5,$6,$7,$8,$9);
+                    """,
+                    quiz_id,
+                    number,
+                    question["question"],
+                    question["option_a"],
+                    question["option_b"],
+                    question["option_c"],
+                    question["option_d"],
+                    question["correct_answer"],
+                    question.get(
+                        "explanation",
+                        "",
+                    ),
+                )
+
+    return int(quiz_id)
+
+
+# =========================================================
+# PREVIEW FORMAT
+# =========================================================
+
+def format_draft_preview(
+    draft: dict,
+    max_questions: int = 20,
+) -> str:
+
+    text = (
+        "<b>📋 QUIZ PREVIEW</b>\n\n"
+        f"<b>Title:</b> "
+        f"{escape(draft['title'])}\n"
+        f"<b>Subject:</b> "
+        f"{escape(draft['subject'] or 'Not specified')}\n"
+        f"<b>Questions:</b> "
+        f"{len(draft['questions'])}\n"
+        f"<b>Time:</b> "
+        f"{draft['time_limit']} minutes\n"
+        f"<b>Negative:</b> "
+        f"{draft['negative_marking']}\n\n"
+    )
+
+    for index, question in enumerate(
+        draft["questions"][:max_questions],
+        start=1,
+    ):
+
+        text += (
+            f"<b>Q{index}.</b> "
+            f"{escape(question['question'])}\n"
+            f"A. {escape(question['option_a'])}\n"
+            f"B. {escape(question['option_b'])}\n"
+            f"C. {escape(question['option_c'])}\n"
+            f"D. {escape(question['option_d'])}\n"
+            f"✅ Correct: "
+            f"{question['correct_answer']}\n"
+        )
+
+        if question.get("explanation"):
+            text += (
+                "💡 "
+                f"{escape(question['explanation'])}\n"
+            )
+
+        text += "\n"
+
+    if len(draft["questions"]) > max_questions:
+        text += (
+            f"<i>Showing first {max_questions} "
+            f"of {len(draft['questions'])} questions.</i>\n"
+        )
+
+    return text
+
+
+# =========================================================
+# CREATE TEXT PROCESSOR
 # =========================================================
 
 async def process_quiz_creation(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message or not message.text:
         return
@@ -788,7 +974,7 @@ async def process_quiz_creation(
 
         if len(text) < 2:
             await message.reply_text(
-                "❌ Quiz title थोड़ा बड़ा रखें."
+                "❌ Quiz title बहुत छोटा है."
             )
             return
 
@@ -797,7 +983,7 @@ async def process_quiz_creation(
 
         await message.reply_text(
             "📚 <b>Subject</b> भेजें.\n\n"
-            "Subject केवल database metadata रहेगा.\n"
+            "यह केवल quiz metadata रहेगा.\n"
             "Subject नहीं देना है तो <code>skip</code> लिखें.",
             parse_mode="HTML",
         )
@@ -835,13 +1021,14 @@ async def process_quiz_creation(
             minutes = int(text)
         except ValueError:
             await message.reply_text(
-                "❌ केवल minutes की संख्या भेजें."
+                "❌ केवल number भेजें.\n"
+                "Example: 30"
             )
             return
 
         if not 1 <= minutes <= 300:
             await message.reply_text(
-                "❌ Time limit 1 से 300 minutes के बीच रखें."
+                "❌ Time 1 से 300 minutes के बीच रखें."
             )
             return
 
@@ -859,7 +1046,7 @@ async def process_quiz_creation(
         return
 
     # -----------------------------------------------------
-    # NEGATIVE
+    # NEGATIVE MARKING
     # -----------------------------------------------------
 
     if state == STATE_NEGATIVE:
@@ -882,18 +1069,16 @@ async def process_quiz_creation(
         draft["state"] = STATE_BATCH
 
         await message.reply_text(
-            "<b>📋 BATCH QUESTION MODE</b>\n\n"
-            "अब सारे questions <b>एक ही message</b> में भेजें.\n\n"
-
+            "<b>📋 अब सारे questions एक साथ भेजें.</b>\n\n"
+            "Example:\n\n"
             "<code>"
-            "Q1. भारत की राजधानी क्या है?\n"
-            "A. पटना\n"
-            "B. दिल्ली\n"
-            "C. मुंबई\n"
-            "D. जयपुर\n"
+            "Q1. भारतीय संविधान का अनुच्छेद 32 किससे संबंधित है?\n"
+            "A. समानता का अधिकार\n"
+            "B. संवैधानिक उपचार का अधिकार\n"
+            "C. स्वतंत्रता का अधिकार\n"
+            "D. शिक्षा का अधिकार\n"
             "Correct: B\n"
-            "Explanation: नई दिल्ली भारत की राजधानी है.\n\n"
-
+            "Explanation: अनुच्छेद 32 संवैधानिक उपचार के अधिकार से संबंधित है.\n\n"
             "Q2. बिहार की राजधानी क्या है?\n"
             "A. गया\n"
             "B. पटना\n"
@@ -902,26 +1087,37 @@ async def process_quiz_creation(
             "Correct: B\n"
             "Explanation: पटना बिहार की राजधानी है."
             "</code>\n\n"
-
-            "💡 1 से 500 तक questions एक batch में भेज सकते हैं.\n"
-            "📎 TXT / CSV / JSON file भी upload कर सकते हैं.\n\n"
-            "❌ /cancel से process रोकें.",
+            "💡 10, 50, 100 या जितने questions "
+            "चाहें एक ही message में भेजें.\n\n"
+            "या .txt / .json / .csv file भेजें.\n\n"
+            "❌ /cancel",
             parse_mode="HTML",
         )
         return
 
     # -----------------------------------------------------
-    # BATCH
+    # BATCH QUESTIONS
     # -----------------------------------------------------
 
     if state == STATE_BATCH:
 
-        questions = parse_batch_questions(text)
+        questions, errors = parse_batch_questions(text)
 
         if not questions:
+
             await message.reply_text(
                 "❌ कोई valid question नहीं मिला.\n\n"
-                "Format check करें और फिर पूरा batch भेजें."
+                "Format check करें:\n\n"
+                "<code>"
+                "Q1. Question\n"
+                "A. Option A\n"
+                "B. Option B\n"
+                "C. Option C\n"
+                "D. Option D\n"
+                "Correct: B\n"
+                "Explanation: Explanation"
+                "</code>",
+                parse_mode="HTML",
             )
             return
 
@@ -929,114 +1125,123 @@ async def process_quiz_creation(
         draft["question_count"] = len(questions)
         draft["state"] = STATE_COMPLETE
 
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "👁 Preview",
-                        callback_data="draft_preview",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "💾 Save Quiz",
-                        callback_data="draft_save",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="draft_cancel",
-                    )
-                ],
-            ]
+        response = (
+            f"✅ <b>{len(questions)} questions detected!</b>\n\n"
+            f"<b>Quiz:</b> "
+            f"{escape(draft['title'])}\n"
+            f"<b>Subject:</b> "
+            f"{escape(draft['subject'] or 'Not specified')}\n"
+            f"<b>Time:</b> "
+            f"{draft['time_limit']} minutes\n"
+            f"<b>Negative:</b> "
+            f"{draft['negative_marking']}\n\n"
+        )
+
+        if errors:
+            response += (
+                f"⚠️ {len(errors)} question blocks "
+                "were skipped because they were incomplete.\n\n"
+            )
+
+        response += (
+            "अब Preview करें या Quiz Save करें."
         )
 
         await message.reply_text(
-            f"✅ <b>{len(questions)} questions detected!</b>\n\n"
-            f"<b>Title:</b> {escape(draft['title'])}\n"
-            f"<b>Subject:</b> "
-            f"{escape(draft['subject'] or 'Not specified')}\n"
-            f"<b>Time:</b> {draft['time_limit']} minutes\n"
-            f"<b>Negative:</b> {draft['negative_marking']}\n\n"
-            "अब Preview या Save Quiz चुनें.",
+            response,
             parse_mode="HTML",
-            reply_markup=keyboard,
+            reply_markup=quiz_creation_keyboard(),
         )
+
         return
 
+    if state == STATE_COMPLETE:
+
+        await message.reply_text(
+            "Quiz तैयार है.\n\n"
+            "ऊपर दिए Preview या Save button का उपयोग करें."
+        )
+
 
 # =========================================================
-# DOCUMENT UPLOAD
+# DOCUMENT / FILE IMPORT
 # =========================================================
 
-async def handle_document(
+async def process_quiz_file(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message or not message.document:
         return
 
     draft = DRAFTS.get(user.id)
 
-    if not draft or draft["state"] != STATE_BATCH:
+    if not draft:
         await message.reply_text(
-            "पहले /create से quiz creation शुरू करें."
+            "पहले /create शुरू करें, फिर question file भेजें."
+        )
+        return
+
+    if draft["state"] != STATE_BATCH:
+        await message.reply_text(
+            "अभी file लेने का चरण नहीं है.\n"
+            "पहले /create पूरा करें."
         )
         return
 
     document = message.document
-    filename = document.file_name or "questions.txt"
+    filename = (
+        document.file_name or ""
+    ).lower()
 
-    allowed = (
-        filename.lower().endswith(".txt")
-        or filename.lower().endswith(".csv")
-        or filename.lower().endswith(".json")
-    )
-
-    if not allowed:
+    if not filename.endswith(
+        (".txt", ".json", ".csv")
+    ):
         await message.reply_text(
-            "❌ केवल TXT, CSV या JSON file supported है."
+            "❌ केवल .txt, .json या .csv file supported है."
         )
         return
 
-    if document.file_size and document.file_size > 10 * 1024 * 1024:
-        await message.reply_text(
-            "❌ File maximum 10 MB की हो सकती है."
-        )
-        return
+    telegram_file = await document.get_file()
+
+    data = await telegram_file.download_as_bytearray()
 
     try:
-        telegram_file = await context.bot.get_file(
-            document.file_id
+        content = bytes(data).decode(
+            "utf-8-sig"
         )
-
-        buffer = io.BytesIO()
-        await telegram_file.download_to_memory(
-            buffer
-        )
-
-        content = buffer.getvalue()
-
-        questions = parse_file_questions(
-            filename,
-            content,
-        )
-
-    except Exception:
-        logger.exception("File parsing failed")
-
+    except UnicodeDecodeError:
         await message.reply_text(
-            "❌ File पढ़ने में समस्या आई."
+            "❌ File UTF-8 text में होनी चाहिए."
         )
         return
 
+    if filename.endswith(".json"):
+
+        questions, errors = parse_json_questions(
+            content
+        )
+
+    elif filename.endswith(".csv"):
+
+        questions, errors = parse_csv_questions(
+            content
+        )
+
+    else:
+
+        questions, errors = parse_batch_questions(
+            content
+        )
+
     if not questions:
+
         await message.reply_text(
-            "❌ File में कोई valid question नहीं मिला."
+            "❌ File से कोई valid question नहीं मिला."
         )
         return
 
@@ -1044,203 +1249,60 @@ async def handle_document(
     draft["question_count"] = len(questions)
     draft["state"] = STATE_COMPLETE
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "👁 Preview",
-                    callback_data="draft_preview",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "💾 Save Quiz",
-                    callback_data="draft_save",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ Cancel",
-                    callback_data="draft_cancel",
-                )
-            ],
-        ]
-    )
-
     await message.reply_text(
         f"✅ File imported successfully.\n\n"
-        f"📄 File: <code>{escape(filename)}</code>\n"
-        f"Questions detected: <b>{len(questions)}</b>\n\n"
-        "Preview या Save Quiz चुनें.",
+        f"📚 Questions detected: "
+        f"<b>{len(questions)}</b>\n\n"
+        "अब Preview या Save Quiz चुनें.",
         parse_mode="HTML",
-        reply_markup=keyboard,
+        reply_markup=quiz_creation_keyboard(),
     )
 
 
 # =========================================================
-# PREVIEW
+# CANCEL
 # =========================================================
 
-def format_preview(draft):
-    text = (
-        "<b>📋 QUIZ PREVIEW</b>\n\n"
-        f"<b>Title:</b> {escape(draft['title'])}\n"
-        f"<b>Subject:</b> "
-        f"{escape(draft['subject'] or 'Not specified')}\n"
-        f"<b>Questions:</b> {len(draft['questions'])}\n"
-        f"<b>Time:</b> {draft['time_limit']} minutes\n"
-        f"<b>Negative:</b> {draft['negative_marking']}\n\n"
-    )
-
-    questions = draft["questions"]
-
-    for index, q in enumerate(questions, 1):
-
-        if index > 30:
-            text += (
-                f"\n... और {len(questions) - 30} questions हैं."
-            )
-            break
-
-        text += (
-            f"<b>Q{index}.</b> "
-            f"{escape(q['question'])}\n"
-            f"A. {escape(q['option_a'])}\n"
-            f"B. {escape(q['option_b'])}\n"
-            f"C. {escape(q['option_c'])}\n"
-            f"D. {escape(q['option_d'])}\n"
-            f"✅ Correct: {q['correct_answer']}\n"
-        )
-
-        if q.get("explanation"):
-            text += (
-                f"💡 {escape(q['explanation'])}\n"
-            )
-
-        text += "\n"
-
-    return text
-
-
-# =========================================================
-# SAVE DRAFT
-# =========================================================
-
-async def save_draft(
-    query,
-    context,
-    user_id,
-):
-    draft = DRAFTS.get(user_id)
-
-    if not draft:
-        await query.message.reply_text(
-            "❌ Draft नहीं मिला."
-        )
-        return
-
-    pool = context.bot_data.get(DB_KEY)
-
-    if pool is None:
-        await query.message.reply_text(
-            "❌ Database connected नहीं है."
-        )
-        return
-
-    if not draft["questions"]:
-        await query.message.reply_text(
-            "❌ Quiz में questions नहीं हैं."
-        )
-        return
-
-    await ensure_quiz_tables(pool)
-
-    async with pool.acquire() as conn:
-
-        quiz_id = await conn.fetchval(
-            """
-            INSERT INTO quizzes
-            (
-                creator_id,
-                title,
-                subject,
-                question_count,
-                time_limit,
-                negative_marking,
-                settings,
-                sections,
-                published
-            )
-            VALUES
-            (
-                $1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,FALSE
-            )
-            RETURNING id;
-            """,
-            user_id,
-            draft["title"],
-            draft["subject"],
-            len(draft["questions"]),
-            draft["time_limit"],
-            draft["negative_marking"],
-            json.dumps(draft["settings"]),
-            json.dumps(draft["sections"]),
-        )
-
-        for number, q in enumerate(
-            draft["questions"],
-            start=1,
-        ):
-            await conn.execute(
-                """
-                INSERT INTO quiz_questions
-                (
-                    quiz_id,
-                    question_no,
-                    question,
-                    option_a,
-                    option_b,
-                    option_c,
-                    option_d,
-                    correct_answer,
-                    explanation
-                )
-                VALUES
-                ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                """,
-                quiz_id,
-                number,
-                q["question"],
-                q["option_a"],
-                q["option_b"],
-                q["option_c"],
-                q["option_d"],
-                q["correct_answer"],
-                q.get("explanation", ""),
-            )
-
-    del DRAFTS[user_id]
-
-    await query.message.reply_text(
-        f"✅ <b>QUIZ SAVED</b>\n\n"
-        f"Quiz ID: <code>{quiz_id}</code>\n"
-        f"Title: {escape(draft['title'])}\n"
-        f"Questions: {len(draft['questions'])}\n\n"
-        f"Status: 🟡 Unpublished\n\n"
-        f"Use:\n"
-        f"<code>/myquizzes</code>",
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# CALLBACK BUTTONS
-# =========================================================
-
-async def quiz_buttons(
+async def cancel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
+    user = update.effective_user
+    message = get_message(update)
+
+    if not user or not message:
+        return
+
+    removed = False
+
+    if user.id in DRAFTS:
+        del DRAFTS[user.id]
+        removed = True
+
+    if user.id in USER_SESSIONS:
+        del USER_SESSIONS[user.id]
+        removed = True
+
+    if removed:
+        await message.reply_text(
+            "❌ Current process cancelled."
+        )
+    else:
+        await message.reply_text(
+            "कोई active process नहीं है."
+        )
+
+
+# =========================================================
+# DRAFT CALLBACKS
+# =========================================================
+
+async def draft_buttons(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
     query = update.callback_query
 
     if not query:
@@ -1249,168 +1311,108 @@ async def quiz_buttons(
     await query.answer()
 
     user = query.from_user
+    draft = DRAFTS.get(user.id)
 
-    if query.data == "draft_preview":
+    if not draft:
+        await query.message.reply_text(
+            "❌ Draft नहीं मिला.\n/create से नया quiz बनाएं."
+        )
+        return
 
-        draft = DRAFTS.get(user.id)
+    action = query.data
 
-        if not draft:
-            await query.message.reply_text(
-                "❌ Draft नहीं मिला."
-            )
-            return
+    # -----------------------------------------------------
+    # PREVIEW
+    # -----------------------------------------------------
+
+    if action == "draft_preview":
 
         await query.message.reply_text(
-            format_preview(draft),
+            format_draft_preview(draft),
             parse_mode="HTML",
         )
         return
 
-    if query.data == "draft_save":
+    # -----------------------------------------------------
+    # SAVE
+    # -----------------------------------------------------
 
-        await save_draft(
-            query,
-            context,
-            user.id,
-        )
-        return
+    if action == "draft_save":
 
-    if query.data == "draft_cancel":
+        pool = get_pool(context)
 
-        DRAFTS.pop(user.id, None)
-
-        await query.message.reply_text(
-            "❌ Quiz creation cancelled."
-        )
-        return
-
-    if query.data == "setting_timer":
-
-        session = QUIZ_SESSIONS.setdefault(
-            user.id,
-            {
-                "settings": default_settings(),
-                "running": False,
-                "paused": False,
-                "poll_active": False,
-                "current_question": 0,
-            },
-        )
-
-        current = session["settings"]["question_timer"]
-
-        current -= 5
-
-        if current < 5:
-            current = 60
-
-        session["settings"]["question_timer"] = current
-
-        await query.message.reply_text(
-            f"⏱ Question timer: {current} seconds"
-        )
-        return
-
-    if query.data == "setting_explanation":
-
-        session = QUIZ_SESSIONS.setdefault(
-            user.id,
-            {
-                "settings": default_settings(),
-                "running": False,
-                "paused": False,
-                "poll_active": False,
-                "current_question": 0,
-            },
-        )
-
-        s = session["settings"]
-
-        s["show_explanation"] = not s["show_explanation"]
-
-        await query.message.reply_text(
-            "💡 Explanation: "
-            + (
-                "ON"
-                if s["show_explanation"]
-                else "OFF"
+        if pool is None:
+            await query.message.reply_text(
+                "⚠️ PostgreSQL database connected नहीं है."
             )
-        )
-        return
+            return
 
-    if query.data == "setting_shuffle_q":
+        if not draft["questions"]:
+            await query.message.reply_text(
+                "❌ Quiz में कम से कम 1 question जरूरी है."
+            )
+            return
 
-        session = QUIZ_SESSIONS.setdefault(
+        quiz_id = await save_draft_to_database(
+            draft,
             user.id,
-            {
-                "settings": default_settings(),
-                "running": False,
-                "paused": False,
-                "poll_active": False,
-                "current_question": 0,
-            },
+            pool,
         )
 
-        s = session["settings"]
+        title = escape(
+            draft["title"]
+        )
 
-        s["shuffle_questions"] = not s["shuffle_questions"]
+        question_count = len(
+            draft["questions"]
+        )
+
+        del DRAFTS[user.id]
 
         await query.message.reply_text(
-            "🔀 Shuffle questions: "
-            + (
-                "ON"
-                if s["shuffle_questions"]
-                else "OFF"
-            )
+            f"✅ <b>Quiz Saved Successfully!</b>\n\n"
+            f"<b>Quiz ID:</b> "
+            f"<code>{quiz_id}</code>\n"
+            f"<b>Title:</b> {title}\n"
+            f"<b>Questions:</b> "
+            f"{question_count}\n\n"
+            f"Quiz अभी unpublished है.",
+            parse_mode="HTML",
         )
         return
 
-    if query.data == "setting_shuffle_o":
+    # -----------------------------------------------------
+    # CANCEL
+    # -----------------------------------------------------
 
-        session = QUIZ_SESSIONS.setdefault(
-            user.id,
-            {
-                "settings": default_settings(),
-                "running": False,
-                "paused": False,
-                "poll_active": False,
-                "current_question": 0,
-            },
-        )
+    if action == "draft_cancel":
 
-        s = session["settings"]
-
-        s["shuffle_options"] = not s["shuffle_options"]
+        del DRAFTS[user.id]
 
         await query.message.reply_text(
-            "🔀 Shuffle options: "
-            + (
-                "ON"
-                if s["shuffle_options"]
-                else "OFF"
-            )
+            "❌ Quiz draft cancelled."
         )
-        return
 
 
 # =========================================================
 # MY QUIZZES
 # =========================================================
 
-async def myquizzes(
+async def my_quizzes(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    user = update.effective_user
-    message = update.effective_message
-    pool = context.bot_data.get(DB_KEY)
+) -> None:
 
-    if not user or not message:
+    message = get_message(update)
+    user = update.effective_user
+    pool = get_pool(context)
+
+    if not message or not user:
         return
 
     if pool is None:
         await message.reply_text(
-            "❌ Database connected नहीं है."
+            "⚠️ Database connected नहीं है."
         )
         return
 
@@ -1429,19 +1431,18 @@ async def myquizzes(
         FROM quizzes
         WHERE creator_id = $1
         ORDER BY id DESC
-        LIMIT 50
+        LIMIT 50;
         """,
         user.id,
     )
 
     if not rows:
+
         await message.reply_text(
-            "📚 अभी कोई quiz नहीं है.\n\n"
+            "📚 आपने अभी कोई quiz create नहीं किया है.\n\n"
             "/create से पहला quiz बनाएं."
         )
         return
-
-    text = "<b>📚 MY QUIZZES</b>\n\n"
 
     for row in rows:
 
@@ -1451,19 +1452,161 @@ async def myquizzes(
             else "🟡 Unpublished"
         )
 
-        text += (
-            f"<b>#{row['id']} — "
-            f"{escape(row['title'])}</b>\n"
-            f"Questions: {row['question_count']}\n"
-            f"Time: {row['time_limit']} min\n"
-            f"Negative: {row['negative_marking']}\n"
-            f"Status: {status}\n\n"
+        text = (
+            "<b>📚 QUIZ</b>\n\n"
+            f"<b>ID:</b> <code>{row['id']}</code>\n"
+            f"<b>Title:</b> "
+            f"{escape(row['title'])}\n"
+            f"<b>Subject:</b> "
+            f"{escape(row['subject'] or 'Not specified')}\n"
+            f"<b>Questions:</b> "
+            f"{row['question_count']}\n"
+            f"<b>Time:</b> "
+            f"{row['time_limit']} min\n"
+            f"<b>Negative:</b> "
+            f"{row['negative_marking']}\n"
+            f"<b>Status:</b> {status}"
         )
 
-    await message.reply_text(
-        text,
-        parse_mode="HTML",
+        await message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=edit_keyboard(
+                row["id"]
+            ),
+        )
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+async def settings(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    message = get_message(update)
+    user = update.effective_user
+
+    if not message or not user:
+        return
+
+    session = USER_SESSIONS.setdefault(
+        user.id,
+        {},
     )
+
+    timer = session.get(
+        "question_timer",
+        30,
+    )
+
+    negative = session.get(
+        "negative_marking",
+        0.25,
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⏱ 15 sec",
+                    callback_data="setting_timer:15",
+                ),
+                InlineKeyboardButton(
+                    "⏱ 30 sec",
+                    callback_data="setting_timer:30",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏱ 60 sec",
+                    callback_data="setting_timer:60",
+                ),
+                InlineKeyboardButton(
+                    "⏱ 120 sec",
+                    callback_data="setting_timer:120",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "➖ No Negative",
+                    callback_data="setting_negative:0",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "➖ 0.25 Negative",
+                    callback_data="setting_negative:0.25",
+                ),
+                InlineKeyboardButton(
+                    "➖ 0.33 Negative",
+                    callback_data="setting_negative:0.33",
+                ),
+            ],
+        ]
+    )
+
+    await message.reply_text(
+        "<b>⚙️ QUIZ SETTINGS</b>\n\n"
+        f"Question timer: <b>{timer} sec</b>\n"
+        f"Negative marking: <b>{negative}</b>\n\n"
+        "अपनी preferred settings चुनें.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+# =========================================================
+# SETTINGS CALLBACK
+# =========================================================
+
+async def settings_buttons(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    await query.answer()
+
+    user = query.from_user
+
+    session = USER_SESSIONS.setdefault(
+        user.id,
+        {},
+    )
+
+    data = query.data
+
+    if data.startswith("setting_timer:"):
+
+        value = int(
+            data.split(":", 1)[1]
+        )
+
+        session["question_timer"] = value
+
+        await query.message.reply_text(
+            f"⏱ Question timer set to {value} seconds."
+        )
+        return
+
+    if data.startswith("setting_negative:"):
+
+        value = float(
+            data.split(":", 1)[1]
+        )
+
+        session["negative_marking"] = value
+
+        await query.message.reply_text(
+            f"➖ Negative marking set to {value}."
+        )
 
 
 # =========================================================
@@ -1473,26 +1616,23 @@ async def myquizzes(
 async def stop_quiz(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.setdefault(
-        user.id,
-        {
-            "settings": default_settings(),
-            "running": False,
-            "paused": False,
-            "poll_active": False,
-            "current_question": 0,
-        },
-    )
+    session = USER_SESSIONS.get(user.id)
 
-    session["running"] = False
-    session["paused"] = False
+    if not session:
+        await message.reply_text(
+            "कोई active quiz नहीं है."
+        )
+        return
+
+    session["status"] = "stopped"
 
     await message.reply_text(
         "⏹ Current quiz stopped."
@@ -1506,34 +1646,26 @@ async def stop_quiz(
 async def pause_quiz(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.setdefault(
-        user.id,
-        {
-            "settings": default_settings(),
-            "running": False,
-            "paused": False,
-            "poll_active": False,
-            "current_question": 0,
-        },
-    )
+    session = USER_SESSIONS.get(user.id)
 
-    if not session["running"]:
+    if not session:
         await message.reply_text(
-            "कोई running quiz नहीं है."
+            "कोई active quiz नहीं है."
         )
         return
 
-    session["paused"] = True
+    session["status"] = "paused"
 
     await message.reply_text(
-        "⏸ Quiz paused.\n"
+        "⏸ Quiz paused.\n\n"
         "/resume से continue करें."
     )
 
@@ -1545,23 +1677,29 @@ async def pause_quiz(
 async def resume_quiz(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.get(user.id)
+    session = USER_SESSIONS.get(user.id)
 
-    if not session or not session["paused"]:
+    if not session:
+        await message.reply_text(
+            "कोई paused quiz नहीं मिला."
+        )
+        return
+
+    if session.get("status") != "paused":
         await message.reply_text(
             "कोई paused quiz नहीं है."
         )
         return
 
-    session["paused"] = False
-    session["running"] = True
+    session["status"] = "running"
 
     await message.reply_text(
         "▶️ Quiz resumed."
@@ -1575,32 +1713,35 @@ async def resume_quiz(
 async def fast_timer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.setdefault(
+    session = USER_SESSIONS.setdefault(
         user.id,
-        {
-            "settings": default_settings(),
-            "running": False,
-            "paused": False,
-            "poll_active": False,
-            "current_question": 0,
-        },
+        {},
     )
 
-    timer = session["settings"]["question_timer"]
+    current = session.get(
+        "question_timer",
+        30,
+    )
 
-    timer = max(5, timer - 5)
+    new_value = max(
+        5,
+        current - 5,
+    )
 
-    session["settings"]["question_timer"] = timer
+    session["question_timer"] = new_value
 
     await message.reply_text(
-        f"⚡ Question timer decreased to {timer} seconds."
+        f"⚡ Question timer decreased to "
+        f"<b>{new_value} seconds</b>.",
+        parse_mode="HTML",
     )
 
 
@@ -1611,32 +1752,35 @@ async def fast_timer(
 async def slow_timer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.setdefault(
+    session = USER_SESSIONS.setdefault(
         user.id,
-        {
-            "settings": default_settings(),
-            "running": False,
-            "paused": False,
-            "poll_active": False,
-            "current_question": 0,
-        },
+        {},
     )
 
-    timer = session["settings"]["question_timer"]
+    current = session.get(
+        "question_timer",
+        30,
+    )
 
-    timer = min(300, timer + 5)
+    new_value = min(
+        300,
+        current + 5,
+    )
 
-    session["settings"]["question_timer"] = timer
+    session["question_timer"] = new_value
 
     await message.reply_text(
-        f"🐢 Question timer increased to {timer} seconds."
+        f"🐢 Question timer increased to "
+        f"<b>{new_value} seconds</b>.",
+        parse_mode="HTML",
     )
 
 
@@ -1647,29 +1791,56 @@ async def slow_timer(
 async def stop_poll(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.setdefault(
-        user.id,
-        {
-            "settings": default_settings(),
-            "running": False,
-            "paused": False,
-            "poll_active": False,
-            "current_question": 0,
-        },
-    )
+    session = USER_SESSIONS.get(user.id)
 
-    session["poll_active"] = False
+    if not session or not session.get("poll_message_id"):
+        await message.reply_text(
+            "कोई active poll नहीं है."
+        )
+        return
 
-    await message.reply_text(
-        "🛑 Active poll stopped."
-    )
+    chat_id = session.get("poll_chat_id")
+    message_id = session.get("poll_message_id")
+
+    try:
+
+        await context.bot.stop_poll(
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+        session.pop(
+            "poll_message_id",
+            None,
+        )
+
+        session.pop(
+            "poll_chat_id",
+            None,
+        )
+
+        await message.reply_text(
+            "⏹ Active poll stopped."
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Unable to stop poll: %s",
+            exc,
+        )
+
+        await message.reply_text(
+            "⚠️ Poll stop नहीं हो सका."
+        )
 
 
 # =========================================================
@@ -1679,51 +1850,79 @@ async def stop_poll(
 async def mistakes(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
+    pool = get_pool(context)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.get(user.id)
-
-    if not session:
+    if pool is None:
         await message.reply_text(
-            "📭 अभी कोई quiz attempt data नहीं है."
+            "⚠️ Database connected नहीं है."
         )
         return
 
-    mistakes_list = session.get(
-        "mistakes",
-        [],
+    await ensure_quiz_tables(pool)
+
+    rows = await pool.fetch(
+        """
+        SELECT
+            q.question,
+            q.option_a,
+            q.option_b,
+            q.option_c,
+            q.option_d,
+            q.correct_answer,
+            a.selected_answer,
+            q.explanation
+        FROM quiz_answers a
+        JOIN quiz_questions q
+          ON q.id = a.question_id
+        WHERE a.user_id = $1
+          AND a.is_correct = FALSE
+        ORDER BY a.answered_at DESC
+        LIMIT 20;
+        """,
+        user.id,
     )
 
-    if not mistakes_list:
+    if not rows:
+
         await message.reply_text(
-            "✅ अभी कोई incorrect answer नहीं है."
+            "🎯 कोई incorrect answer record नहीं मिला."
         )
         return
 
-    text = "<b>❌ INCORRECT ANSWERS</b>\n\n"
-
-    for index, item in enumerate(
-        mistakes_list[:50],
-        1,
+    for index, row in enumerate(
+        rows,
+        start=1,
     ):
-        text += (
-            f"<b>{index}.</b> "
-            f"{escape(item.get('question', ''))}\n"
+
+        text = (
+            f"<b>❌ Mistake #{index}</b>\n\n"
+            f"<b>{escape(row['question'])}</b>\n\n"
+            f"A. {escape(row['option_a'])}\n"
+            f"B. {escape(row['option_b'])}\n"
+            f"C. {escape(row['option_c'])}\n"
+            f"D. {escape(row['option_d'])}\n\n"
             f"Your answer: "
-            f"{escape(item.get('your_answer', ''))}\n"
+            f"<b>{escape(row['selected_answer'] or '-')}</b>\n"
             f"Correct: "
-            f"{escape(item.get('correct_answer', ''))}\n\n"
+            f"<b>{escape(row['correct_answer'])}</b>\n"
         )
 
-    await message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
+        if row["explanation"]:
+            text += (
+                f"\n💡 {escape(row['explanation'])}"
+            )
+
+        await message.reply_text(
+            text,
+            parse_mode="HTML",
+        )
 
 
 # =========================================================
@@ -1733,65 +1932,94 @@ async def mistakes(
 async def bookmarks(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
+    pool = get_pool(context)
 
     if not user or not message:
         return
 
-    session = QUIZ_SESSIONS.get(user.id)
-
-    if not session:
+    if pool is None:
         await message.reply_text(
-            "🔖 अभी कोई bookmarks नहीं हैं."
+            "⚠️ Database connected नहीं है."
         )
         return
 
-    bookmarks_list = session.get(
-        "bookmarks",
-        [],
+    await ensure_quiz_tables(pool)
+
+    rows = await pool.fetch(
+        """
+        SELECT
+            q.question,
+            q.option_a,
+            q.option_b,
+            q.option_c,
+            q.option_d,
+            q.correct_answer,
+            q.explanation
+        FROM quiz_bookmarks b
+        JOIN quiz_questions q
+          ON q.id = b.question_id
+        WHERE b.user_id = $1
+        ORDER BY b.created_at DESC
+        LIMIT 50;
+        """,
+        user.id,
     )
 
-    if not bookmarks_list:
+    if not rows:
+
         await message.reply_text(
-            "🔖 अभी कोई bookmarked question नहीं है."
+            "🔖 कोई bookmarked question नहीं है."
         )
         return
 
-    text = "<b>🔖 BOOKMARKS</b>\n\n"
-
-    for index, item in enumerate(
-        bookmarks_list[:50],
-        1,
+    for index, row in enumerate(
+        rows,
+        start=1,
     ):
-        text += (
-            f"<b>{index}.</b> "
-            f"{escape(item.get('question', ''))}\n\n"
+
+        text = (
+            f"<b>🔖 Bookmark #{index}</b>\n\n"
+            f"<b>{escape(row['question'])}</b>\n\n"
+            f"A. {escape(row['option_a'])}\n"
+            f"B. {escape(row['option_b'])}\n"
+            f"C. {escape(row['option_c'])}\n"
+            f"D. {escape(row['option_d'])}\n\n"
+            f"Correct: <b>{row['correct_answer']}</b>"
         )
 
-    await message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
+        if row["explanation"]:
+            text += (
+                f"\n\n💡 "
+                f"{escape(row['explanation'])}"
+            )
+
+        await message.reply_text(
+            text,
+            parse_mode="HTML",
+        )
 
 
 # =========================================================
-# SECTION CREATOR
+# SECTION CREATION
 # =========================================================
 
-async def section(
+async def section_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     user = update.effective_user
-    message = update.effective_message
+    message = get_message(update)
 
     if not user or not message:
         return
 
     DRAFTS[user.id] = {
-        "state": STATE_SECTION_TITLE,
+        "state": STATE_TITLE,
         "title": "",
         "subject": "",
         "question_count": 0,
@@ -1799,169 +2027,121 @@ async def section(
         "negative_marking": 0,
         "questions": [],
         "sections": [],
-        "settings": default_settings(),
+        "section_mode": True,
     }
 
     await message.reply_text(
-        "<b>🧩 TIMED SECTION QUIZ</b>\n\n"
-        "Quiz title भेजें.",
+        "<b>🧩 SECTION QUIZ</b>\n\n"
+        "पहले quiz title भेजें.\n\n"
+        "इसके बाद आप section configuration "
+        "और questions add कर सकते हैं.\n\n"
+        "❌ /cancel",
         parse_mode="HTML",
     )
-
-
-# =========================================================
-# SECTION CREATION PROCESS
-# =========================================================
-
-async def process_section_creation(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user = update.effective_user
-    message = update.effective_message
-
-    if not user or not message or not message.text:
-        return
-
-    draft = DRAFTS.get(user.id)
-
-    if not draft:
-        return
-
-    text = message.text.strip()
-
-    if draft["state"] == STATE_SECTION_TITLE:
-
-        draft["title"] = text
-        draft["state"] = STATE_SECTION_TIME
-
-        await message.reply_text(
-            "⏱️ Section का time limit minutes में भेजें.\n"
-            "Example: 15"
-        )
-        return
-
-    if draft["state"] == STATE_SECTION_TIME:
-
-        try:
-            minutes = int(text)
-        except ValueError:
-            await message.reply_text(
-                "❌ केवल number भेजें."
-            )
-            return
-
-        if not 1 <= minutes <= 180:
-            await message.reply_text(
-                "❌ 1–180 minutes रखें."
-            )
-            return
-
-        draft["sections"].append(
-            {
-                "title": f"Section {len(draft['sections']) + 1}",
-                "time_limit": minutes,
-            }
-        )
-
-        draft["state"] = STATE_SECTION_QUESTIONS
-
-        await message.reply_text(
-            "📋 अब इस section के सारे questions "
-            "एक message में भेजें.\n\n"
-            "Same Q1/A/B/C/D/Correct/Explanation format use करें."
-        )
-        return
-
-    if draft["state"] == STATE_SECTION_QUESTIONS:
-
-        questions = parse_batch_questions(text)
-
-        if not questions:
-            await message.reply_text(
-                "❌ Valid questions नहीं मिले."
-            )
-            return
-
-        draft["questions"].extend(questions)
-
-        draft["question_count"] = len(
-            draft["questions"]
-        )
-
-        draft["state"] = STATE_COMPLETE
-
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "💾 Save Section Quiz",
-                        callback_data="draft_save",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Cancel",
-                        callback_data="draft_cancel",
-                    )
-                ],
-            ]
-        )
-
-        await message.reply_text(
-            f"✅ Section created.\n\n"
-            f"Questions: {len(questions)}\n"
-            f"Section time: "
-            f"{draft['sections'][-1]['time_limit']} min\n\n"
-            "Save करें.",
-            reply_markup=keyboard,
-        )
 
 
 # =========================================================
 # TESTBOOK IMPORT
 # =========================================================
 
-def fetch_url_text(url: str):
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("Invalid URL")
+def fetch_url_text(url: str) -> str:
 
     request = Request(
         url,
         headers={
-            "User-Agent":
+            "User-Agent": (
                 "Mozilla/5.0 "
-                "(compatible; QuizCreatorBot/1.0)"
+                "(compatible; QuizBot/1.0)"
+            )
         },
     )
 
     with urlopen(
         request,
-        timeout=15,
+        timeout=20,
     ) as response:
-        data = response.read(
-            2 * 1024 * 1024
-        )
 
-    return data.decode(
+        raw = response.read()
+
+    return raw.decode(
         "utf-8",
         errors="ignore",
     )
 
 
-async def testbook(
+def html_to_text(html: str) -> str:
+
+    # Remove scripts/styles
+    html = re.sub(
+        r"(?is)<script.*?</script>",
+        " ",
+        html,
+    )
+
+    html = re.sub(
+        r"(?is)<style.*?</style>",
+        " ",
+        html,
+    )
+
+    # Convert common breaks
+    html = re.sub(
+        r"(?i)<br\s*/?>",
+        "\n",
+        html,
+    )
+
+    html = re.sub(
+        r"(?i)</(?:p|div|li|h1|h2|h3|h4|tr)>",
+        "\n",
+        html,
+    )
+
+    # Remove remaining tags
+    html = re.sub(
+        r"(?s)<[^>]+>",
+        " ",
+        html,
+    )
+
+    # Decode common entities
+    html = (
+        html.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
+
+    lines = [
+        re.sub(
+            r"\s+",
+            " ",
+            line,
+        ).strip()
+        for line in html.splitlines()
+    ]
+
+    return "\n".join(
+        line
+        for line in lines
+        if line
+    )
+
+
+async def testbook_import(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    user = update.effective_user
-    message = update.effective_message
+) -> None:
 
-    if not user or not message:
+    message = get_message(update)
+
+    if not message:
         return
 
     if not context.args:
+
         await message.reply_text(
             "<b>Testbook Import</b>\n\n"
             "Usage:\n"
@@ -1972,71 +2152,62 @@ async def testbook(
 
     url = context.args[0]
 
-    if "testbook.com" not in url.lower():
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {
+        "http",
+        "https",
+    }:
         await message.reply_text(
-            "❌ कृपया valid Testbook URL दें."
+            "❌ Valid HTTP/HTTPS URL भेजें."
         )
         return
 
     await message.reply_text(
-        "🔄 Testbook page पढ़ी जा रही है..."
+        "⏳ Testbook page fetch कर रहा हूँ..."
     )
 
     try:
-        html = fetch_url_text(url)
 
-    except Exception:
+        html = await asyncio.to_thread(
+            fetch_url_text,
+            url,
+        )
+
+        text = html_to_text(html)
+
+        questions, errors = parse_batch_questions(
+            text
+        )
+
+    except Exception as exc:
+
         logger.exception(
-            "Testbook URL fetch failed"
+            "Testbook import failed: %s",
+            exc,
         )
 
         await message.reply_text(
-            "❌ Testbook page fetch नहीं हो सकी.\n\n"
-            "अगर page login/JavaScript protected है, "
-            "तो attempted quiz को TXT/CSV/JSON format में "
-            "upload करें."
+            "❌ Testbook page import नहीं हो सका.\n\n"
+            "अगर page dynamically loaded है, "
+            "तो questions को .txt/.json/.csv में "
+            "export करके /create से import करें."
         )
         return
-
-    # Extract visible-looking text from basic HTML.
-    clean = re.sub(
-        r"<script.*?</script>",
-        " ",
-        html,
-        flags=re.I | re.S,
-    )
-
-    clean = re.sub(
-        r"<style.*?</style>",
-        " ",
-        clean,
-        flags=re.I | re.S,
-    )
-
-    clean = re.sub(
-        r"<[^>]+>",
-        "\n",
-        clean,
-    )
-
-    clean = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        clean,
-    )
-
-    questions = parse_batch_questions(
-        clean
-    )
 
     if not questions:
 
         await message.reply_text(
-            "⚠️ Page मिली, लेकिन standard "
-            "question format में questions extract नहीं हुए.\n\n"
-            "Testbook का login/JavaScript page होने पर "
-            "TXT/CSV/JSON upload method use करें."
+            "❌ इस URL से structured questions "
+            "detect नहीं हुए.\n\n"
+            "आप /create में question text "
+            "या supported file भेज सकते हैं."
         )
+        return
+
+    user = update.effective_user
+
+    if not user:
         return
 
     DRAFTS[user.id] = {
@@ -2048,7 +2219,116 @@ async def testbook(
         "negative_marking": 0,
         "questions": questions,
         "sections": [],
-        "settings": default_settings(),
+        "source_url": url,
+    }
+
+    await message.reply_text(
+        f"✅ <b>{len(questions)} questions imported.</b>\n\n"
+        "अब Preview या Save Quiz करें.",
+        parse_mode="HTML",
+        reply_markup=quiz_creation_keyboard(),
+    )
+
+
+# =========================================================
+# EDIT QUIZ
+# =========================================================
+
+async def edit_quiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    message = get_message(update)
+    user = update.effective_user
+    pool = get_pool(context)
+
+    if not message or not user:
+        return
+
+    if not context.args:
+
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/editquiz QUIZ_ID</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        quiz_id = int(
+            context.args[0]
+        )
+    except ValueError:
+
+        await message.reply_text(
+            "❌ Invalid Quiz ID."
+        )
+        return
+
+    if pool is None:
+        await message.reply_text(
+            "⚠️ Database connected नहीं है."
+        )
+        return
+
+    quiz = await pool.fetchrow(
+        """
+        SELECT *
+        FROM quizzes
+        WHERE id = $1
+          AND creator_id = $2;
+        """,
+        quiz_id,
+        user.id,
+    )
+
+    if not quiz:
+
+        await message.reply_text(
+            "❌ Quiz नहीं मिला."
+        )
+        return
+
+    questions = await pool.fetch(
+        """
+        SELECT
+            question_no,
+            question,
+            option_a,
+            option_b,
+            option_c,
+            option_d,
+            correct_answer,
+            explanation
+        FROM quiz_questions
+        WHERE quiz_id = $1
+        ORDER BY question_no;
+        """,
+        quiz_id,
+    )
+
+    DRAFTS[user.id] = {
+        "state": STATE_COMPLETE,
+        "title": quiz["title"],
+        "subject": quiz["subject"] or "",
+        "question_count": len(questions),
+        "time_limit": quiz["time_limit"],
+        "negative_marking": quiz["negative_marking"],
+        "questions": [
+            {
+                "question": row["question"],
+                "option_a": row["option_a"],
+                "option_b": row["option_b"],
+                "option_c": row["option_c"],
+                "option_d": row["option_d"],
+                "correct_answer": row["correct_answer"],
+                "explanation": row["explanation"] or "",
+            }
+            for row in questions
+        ],
+        "editing_quiz_id": quiz_id,
+        "sections": [],
     }
 
     keyboard = InlineKeyboardMarkup(
@@ -2061,8 +2341,8 @@ async def testbook(
             ],
             [
                 InlineKeyboardButton(
-                    "💾 Save Quiz",
-                    callback_data="draft_save",
+                    "💾 Save Changes",
+                    callback_data="draft_update",
                 )
             ],
             [
@@ -2075,44 +2355,431 @@ async def testbook(
     )
 
     await message.reply_text(
-        f"✅ <b>{len(questions)} questions imported.</b>\n\n"
-        "Preview या Save Quiz चुनें.",
+        f"✏️ <b>Editing Quiz #{quiz_id}</b>\n\n"
+        f"{escape(quiz['title'])}\n"
+        f"Questions: {len(questions)}\n\n"
+        "Preview या Save Changes चुनें.",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
 
 
 # =========================================================
-# CANCEL
+# UPDATE EXISTING QUIZ
 # =========================================================
 
-async def cancel(
+async def update_existing_quiz(
+    draft: dict,
+    user_id: int,
+    pool,
+) -> int:
+
+    quiz_id = draft.get(
+        "editing_quiz_id"
+    )
+
+    if not quiz_id:
+        raise ValueError(
+            "Missing editing quiz ID."
+        )
+
+    async with pool.acquire() as conn:
+
+        async with conn.transaction():
+
+            result = await conn.execute(
+                """
+                UPDATE quizzes
+                SET
+                    title = $1,
+                    subject = $2,
+                    question_count = $3,
+                    time_limit = $4,
+                    negative_marking = $5,
+                    published = FALSE
+                WHERE id = $6
+                  AND creator_id = $7;
+                """,
+                draft["title"],
+                draft["subject"] or None,
+                len(draft["questions"]),
+                draft["time_limit"],
+                draft["negative_marking"],
+                quiz_id,
+                user_id,
+            )
+
+            if result.endswith("0"):
+                raise ValueError(
+                    "Quiz not found."
+                )
+
+            await conn.execute(
+                """
+                DELETE FROM quiz_questions
+                WHERE quiz_id = $1;
+                """,
+                quiz_id,
+            )
+
+            for number, question in enumerate(
+                draft["questions"],
+                start=1,
+            ):
+
+                await conn.execute(
+                    """
+                    INSERT INTO quiz_questions
+                    (
+                        quiz_id,
+                        question_no,
+                        question,
+                        option_a,
+                        option_b,
+                        option_c,
+                        option_d,
+                        correct_answer,
+                        explanation
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5,$6,$7,$8,$9);
+                    """,
+                    quiz_id,
+                    number,
+                    question["question"],
+                    question["option_a"],
+                    question["option_b"],
+                    question["option_c"],
+                    question["option_d"],
+                    question["correct_answer"],
+                    question.get(
+                        "explanation",
+                        "",
+                    ),
+                )
+
+    return int(quiz_id)
+
+
+# =========================================================
+# DELETE QUIZ
+# =========================================================
+
+async def delete_quiz(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    user = update.effective_user
-    message = update.effective_message
+) -> None:
 
-    if not user or not message:
+    message = get_message(update)
+    user = update.effective_user
+    pool = get_pool(context)
+
+    if not message or not user:
         return
 
-    removed = False
+    if not context.args:
 
-    if user.id in DRAFTS:
-        del DRAFTS[user.id]
-        removed = True
-
-    if user.id in QUIZ_SESSIONS:
-        QUIZ_SESSIONS[user.id]["paused"] = False
-
-    if removed:
         await message.reply_text(
-            "❌ Current creation/editing process cancelled."
+            "Usage:\n"
+            "<code>/deletequiz QUIZ_ID</code>",
+            parse_mode="HTML",
         )
-    else:
+        return
+
+    try:
+        quiz_id = int(
+            context.args[0]
+        )
+    except ValueError:
+
         await message.reply_text(
-            "कोई active creation/editing process नहीं है."
+            "❌ Invalid Quiz ID."
         )
+        return
+
+    if pool is None:
+
+        await message.reply_text(
+            "⚠️ Database connected नहीं है."
+        )
+        return
+
+    result = await pool.execute(
+        """
+        DELETE FROM quizzes
+        WHERE id = $1
+          AND creator_id = $2;
+        """,
+        quiz_id,
+        user.id,
+    )
+
+    if result.endswith("0"):
+
+        await message.reply_text(
+            "❌ Quiz नहीं मिला."
+        )
+        return
+
+    await message.reply_text(
+        f"🗑 Quiz #{quiz_id} deleted successfully."
+    )
+
+
+# =========================================================
+# PUBLISH QUIZ
+# =========================================================
+
+async def publish_quiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    message = get_message(update)
+    user = update.effective_user
+    pool = get_pool(context)
+
+    if not message or not user:
+        return
+
+    if not context.args:
+
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/publish QUIZ_ID</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        quiz_id = int(
+            context.args[0]
+        )
+    except ValueError:
+
+        await message.reply_text(
+            "❌ Invalid Quiz ID."
+        )
+        return
+
+    if pool is None:
+
+        await message.reply_text(
+            "⚠️ Database connected नहीं है."
+        )
+        return
+
+    question_count = await pool.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM quiz_questions q
+        JOIN quizzes z
+          ON z.id = q.quiz_id
+        WHERE z.id = $1
+          AND z.creator_id = $2;
+        """,
+        quiz_id,
+        user.id,
+    )
+
+    if not question_count:
+
+        await message.reply_text(
+            "❌ Quiz में कोई question नहीं है."
+        )
+        return
+
+    result = await pool.execute(
+        """
+        UPDATE quizzes
+        SET
+            published = TRUE,
+            question_count = $1
+        WHERE id = $2
+          AND creator_id = $3;
+        """,
+        question_count,
+        quiz_id,
+        user.id,
+    )
+
+    if result.endswith("0"):
+
+        await message.reply_text(
+            "❌ Quiz नहीं मिला."
+        )
+        return
+
+    await message.reply_text(
+        f"🚀 Quiz <b>#{quiz_id}</b> published successfully.",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# STORED QUIZ PREVIEW
+# =========================================================
+
+async def stored_preview(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    quiz_id: int,
+) -> None:
+
+    message = get_message(update)
+    user = update.effective_user
+    pool = get_pool(context)
+
+    if not message or not user or pool is None:
+        return
+
+    quiz = await pool.fetchrow(
+        """
+        SELECT *
+        FROM quizzes
+        WHERE id = $1
+          AND creator_id = $2;
+        """,
+        quiz_id,
+        user.id,
+    )
+
+    if not quiz:
+
+        await message.reply_text(
+            "❌ Quiz नहीं मिला."
+        )
+        return
+
+    questions = await pool.fetch(
+        """
+        SELECT *
+        FROM quiz_questions
+        WHERE quiz_id = $1
+        ORDER BY question_no;
+        """,
+        quiz_id,
+    )
+
+    text = (
+        "<b>📋 QUIZ PREVIEW</b>\n\n"
+        f"<b>Title:</b> "
+        f"{escape(quiz['title'])}\n"
+        f"<b>Subject:</b> "
+        f"{escape(quiz['subject'] or 'Not specified')}\n"
+        f"<b>Questions:</b> "
+        f"{len(questions)}\n"
+        f"<b>Time:</b> "
+        f"{quiz['time_limit']} minutes\n"
+        f"<b>Negative:</b> "
+        f"{quiz['negative_marking']}\n\n"
+    )
+
+    for index, row in enumerate(
+        questions[:20],
+        start=1,
+    ):
+
+        text += (
+            f"<b>Q{index}.</b> "
+            f"{escape(row['question'])}\n"
+            f"A. {escape(row['option_a'])}\n"
+            f"B. {escape(row['option_b'])}\n"
+            f"C. {escape(row['option_c'])}\n"
+            f"D. {escape(row['option_d'])}\n"
+            f"Correct: "
+            f"{row['correct_answer']}\n\n"
+        )
+
+    await message.reply_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# CALLBACK ROUTER
+# =========================================================
+
+async def callback_router(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    data = query.data or ""
+
+    # Draft buttons
+    if data.startswith("draft_"):
+
+        await draft_buttons(
+            update,
+            context,
+        )
+        return
+
+    # Settings
+    if data.startswith("setting_"):
+
+        await settings_buttons(
+            update,
+            context,
+        )
+        return
+
+    # Stored quiz preview
+    if data.startswith("stored_preview:"):
+
+        await query.answer()
+
+        try:
+            quiz_id = int(
+                data.split(":", 1)[1]
+            )
+        except ValueError:
+
+            await query.message.reply_text(
+                "❌ Invalid quiz ID."
+            )
+            return
+
+        await stored_preview(
+            update,
+            context,
+            quiz_id,
+        )
+        return
+
+    # Edit questions
+    if data.startswith("edit_questions:"):
+
+        await query.answer()
+
+        try:
+            quiz_id = int(
+                data.split(":", 1)[1]
+            )
+        except ValueError:
+
+            await query.message.reply_text(
+                "❌ Invalid quiz ID."
+            )
+            return
+
+        await query.message.reply_text(
+            f"✏️ Quiz #{quiz_id} को edit करने के लिए:\n\n"
+            f"<code>/editquiz {quiz_id}</code>\n\n"
+            "इसके बाद पूरा question set "
+            "दोबारा import करके Save Changes करें.",
+            parse_mode="HTML",
+        )
+        return
+
+    await query.answer()
 
 
 # =========================================================
@@ -2122,8 +2789,9 @@ async def cancel(
 async def unknown_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.effective_message
+) -> None:
+
+    message = get_message(update)
 
     if not message:
         return
@@ -2135,31 +2803,48 @@ async def unknown_command(
 
 
 # =========================================================
-# TEXT MENU
+# MENU TEXT BUTTONS
 # =========================================================
 
-async def menu_text(
+async def menu_buttons(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.effective_message
+) -> None:
+
+    message = get_message(update)
 
     if not message or not message.text:
         return
 
     text = message.text.strip()
 
-    if text == "📝 Create Quiz":
-        await create_quiz(update, context)
+    if text == "➕ Create Quiz":
+
+        await create_quiz(
+            update,
+            context,
+        )
 
     elif text == "📚 My Quizzes":
-        await myquizzes(update, context)
+
+        await my_quizzes(
+            update,
+            context,
+        )
 
     elif text == "⚙️ Settings":
-        await settings(update, context)
+
+        await settings(
+            update,
+            context,
+        )
 
     elif text == "📖 Tutorial":
-        await tutorial(update, context)
+
+        await tutorial(
+            update,
+            context,
+        )
 
 
 # =========================================================
@@ -2169,13 +2854,19 @@ async def menu_text(
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
+
     error = context.error
 
     if isinstance(
         error,
-        (Conflict, NetworkError, TimedOut),
+        (
+            Conflict,
+            NetworkError,
+            TimedOut,
+        ),
     ):
+
         logger.warning(
             "Transient Telegram error: %s",
             error,
@@ -2190,14 +2881,15 @@ async def error_handler(
 
 
 # =========================================================
-# TELEGRAM COMMAND MENU
+# SET TELEGRAM COMMAND MENU
 # =========================================================
 
 async def set_bot_commands(
     application: Application,
-):
+) -> None:
+
     await application.bot.set_my_commands(
-        BOT_COMMANDS
+        list(BOT_COMMANDS)
     )
 
 
@@ -2207,7 +2899,7 @@ async def set_bot_commands(
 
 def register_handlers(
     application: Application,
-):
+) -> None:
 
     # -----------------------------------------------------
     # EXACT COMMANDS
@@ -2222,7 +2914,7 @@ def register_handlers(
     )
 
     application.add_handler(
-        CommandHandler("myquizzes", myquizzes)
+        CommandHandler("myquizzes", my_quizzes)
     )
 
     application.add_handler(
@@ -2238,7 +2930,7 @@ def register_handlers(
     )
 
     application.add_handler(
-        CommandHandler("section", section)
+        CommandHandler("section", section_command)
     )
 
     application.add_handler(
@@ -2270,7 +2962,7 @@ def register_handlers(
     )
 
     application.add_handler(
-        CommandHandler("testbook", testbook)
+        CommandHandler("testbook", testbook_import)
     )
 
     application.add_handler(
@@ -2282,50 +2974,50 @@ def register_handlers(
     )
 
     # -----------------------------------------------------
-    # INLINE BUTTONS
+    # IMPORTANT:
+    # The following are NOT Telegram commands.
+    # They are internal compatibility handlers for
+    # existing quiz-management functionality.
+    # -----------------------------------------------------
+
+    # Edit/delete/publish are intentionally NOT exposed
+    # in the Telegram command menu, per the requested
+    # exact 19-command public command system.
+    #
+    # They can be reached through normal quiz-management
+    # buttons/workflows.
+
+    # -----------------------------------------------------
+    # CALLBACKS
     # -----------------------------------------------------
 
     application.add_handler(
         CallbackQueryHandler(
-            quiz_buttons,
-            pattern=r"^(draft_|setting_)",
+            callback_router,
+            pattern=r"^(draft_|setting_|stored_preview:|edit_questions:)",
         )
     )
 
     # -----------------------------------------------------
-    # BATCH QUIZ TEXT
-    # -----------------------------------------------------
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            process_quiz_creation,
-        ),
-        group=0,
-    )
-
-    # -----------------------------------------------------
-    # SECTION TEXT
-    # -----------------------------------------------------
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            process_section_creation,
-        ),
-        group=1,
-    )
-
-    # -----------------------------------------------------
-    # FILE UPLOAD
+    # DOCUMENT IMPORT
     # -----------------------------------------------------
 
     application.add_handler(
         MessageHandler(
             filters.Document.ALL,
-            handle_document,
+            process_quiz_file,
+        ),
+        group=0,
+    )
+
+    # -----------------------------------------------------
+    # BATCH TEXT PROCESSOR
+    # -----------------------------------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            process_quiz_creation,
         ),
         group=0,
     )
@@ -2337,20 +3029,23 @@ def register_handlers(
     application.add_handler(
         MessageHandler(
             filters.Regex(
-                r"^(📝 Create Quiz|📚 My Quizzes|"
+                r"^(➕ Create Quiz|📚 My Quizzes|"
                 r"⚙️ Settings|📖 Tutorial)$"
             ),
-            menu_text,
+            menu_buttons,
         ),
-        group=2,
+        group=1,
     )
 
     # -----------------------------------------------------
     # UNKNOWN COMMAND
     # -----------------------------------------------------
+    #
     # IMPORTANT:
-    # Same group, registered AFTER valid commands.
-    # Therefore valid commands are not reported as unknown.
+    # Same group as CommandHandlers and registered LAST.
+    # Therefore valid commands are handled first and do
+    # NOT produce "Unknown command".
+    #
 
     application.add_handler(
         MessageHandler(
@@ -2359,19 +3054,3 @@ def register_handlers(
         ),
         group=0,
     )
-</textarea>
-
-</div>
-
-<script>
-function copyCode() {
-    const code = document.getElementById("code").value;
-
-    navigator.clipboard.writeText(code).then(() => {
-        alert("handlers.py code copied!");
-    });
-}
-</script>
-
-</body>
-</html>
