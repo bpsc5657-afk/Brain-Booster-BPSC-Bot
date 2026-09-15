@@ -60,27 +60,218 @@ BOT_COMMANDS = (
 
 
 # =========================================================
-# IN-MEMORY USER STATE
+# BATCH QUIZ CREATION PROCESSOR
 # =========================================================
 
-DRAFTS = {}
-SESSIONS = {}
-ACTIVE_POLLS = {}
+async def process_quiz_creation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    uid = user_id(update)
+    message = update.effective_message
 
+    if not uid or not message or not message.text:
+        return
 
-STATE_TITLE = "title"
-STATE_SUBJECT = "subject"
-STATE_COUNT = "count"
-STATE_TIME = "time"
-STATE_NEGATIVE = "negative"
-STATE_QUESTION = "question"
-STATE_OPTION_A = "option_a"
-STATE_OPTION_B = "option_b"
-STATE_OPTION_C = "option_c"
-STATE_OPTION_D = "option_d"
-STATE_CORRECT = "correct"
-STATE_EXPLANATION = "explanation"
+    draft = DRAFTS.get(uid)
 
+    if not draft:
+        return
+
+    text = message.text.strip()
+    state = draft["state"]
+
+    # =====================================================
+    # TITLE
+    # =====================================================
+
+    if state == STATE_TITLE:
+
+        if len(text) < 2:
+            await message.reply_text(
+                "❌ Quiz title थोड़ा बड़ा रखें."
+            )
+            return
+
+        draft["title"] = text
+        draft["state"] = STATE_SUBJECT
+
+        await message.reply_text(
+            "📚 <b>Subject</b> भेजें.\n\n"
+            "Subject केवल database metadata रहेगा.\n"
+            "Subject नहीं देना है तो <code>skip</code> लिखें.",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # SUBJECT
+    # =====================================================
+
+    if state == STATE_SUBJECT:
+
+        draft["subject"] = (
+            ""
+            if text.lower() == "skip"
+            else text
+        )
+
+        draft["state"] = STATE_TIME
+
+        await message.reply_text(
+            "⏱️ <b>Time Limit</b>\n\n"
+            "Quiz कितने minutes का होगा?\n\n"
+            "Example: <code>30</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # TIME
+    # =====================================================
+
+    if state == STATE_TIME:
+
+        try:
+            minutes = int(text)
+        except ValueError:
+            await message.reply_text(
+                "❌ केवल minutes की संख्या भेजें.\n"
+                "Example: 30"
+            )
+            return
+
+        if not 1 <= minutes <= 300:
+            await message.reply_text(
+                "❌ Time limit 1 से 300 minutes के बीच रखें."
+            )
+            return
+
+        draft["time_limit"] = minutes
+        draft["state"] = STATE_NEGATIVE
+
+        await message.reply_text(
+            "➖ <b>Negative Marking</b>\n\n"
+            "0 = No negative marking\n"
+            "0.25 = 1/4\n"
+            "0.33 = 1/3\n\n"
+            "Example: <code>0.25</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # NEGATIVE MARKING
+    # =====================================================
+
+    if state == STATE_NEGATIVE:
+
+        try:
+            negative = float(text)
+        except ValueError:
+            await message.reply_text(
+                "❌ Example: 0, 0.25 या 0.33"
+            )
+            return
+
+        if not 0 <= negative <= 1:
+            await message.reply_text(
+                "❌ Negative marking 0 से 1 के बीच रखें."
+            )
+            return
+
+        draft["negative_marking"] = negative
+        draft["state"] = "batch_questions"
+
+        await message.reply_text(
+            "📋 <b>अब सारे Questions एक साथ भेजें.</b>\n\n"
+            "Format:\n\n"
+            "<code>"
+            "Q1. Question text\n"
+            "A. Option A\n"
+            "B. Option B\n"
+            "C. Option C\n"
+            "D. Option D\n"
+            "Correct: B\n"
+            "Explanation: Explanation text\n\n"
+            "Q2. Question text\n"
+            "A. Option A\n"
+            "B. Option B\n"
+            "C. Option C\n"
+            "D. Option D\n"
+            "Correct: C\n"
+            "Explanation: Explanation text"
+            "</code>\n\n"
+            "💡 जितने questions भेजेंगे, "
+            "उतने ही quiz में add होंगे.\n\n"
+            "❌ रोकने के लिए /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # BATCH QUESTIONS
+    # =====================================================
+
+    if state == "batch_questions":
+
+        questions = parse_batch_questions(text)
+
+        if not questions:
+
+            await message.reply_text(
+                "❌ कोई valid question नहीं मिला.\n\n"
+                "कृपया format इस तरह रखें:\n\n"
+                "<code>"
+                "Q1. भारत की राजधानी क्या है?\n"
+                "A. पटना\n"
+                "B. दिल्ली\n"
+                "C. मुंबई\n"
+                "D. जयपुर\n"
+                "Correct: B\n"
+                "Explanation: नई दिल्ली भारत की राजधानी है."
+                "</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        draft["questions"] = questions
+        draft["question_count"] = len(questions)
+        draft["state"] = "complete"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "👁 Preview Quiz",
+                    callback_data="draft_preview",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💾 Save Quiz",
+                    callback_data="draft_save",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="draft_cancel",
+                )
+            ],
+        ])
+
+        await message.reply_text(
+            f"✅ <b>{len(questions)} questions detected!</b>\n\n"
+            f"Quiz: <b>{escape(draft['title'])}</b>\n"
+            f"Subject: "
+            f"<b>{escape(draft['subject'] or 'Not specified')}</b>\n"
+            f"Time: <b>{draft['time_limit']} minutes</b>\n"
+            f"Negative: <b>{draft['negative_marking']}</b>\n\n"
+            "अब Preview या Save Quiz चुनें.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
 MENU_HELP = "Help"
 MENU_TUTORIAL = "Tutorial"
 
@@ -343,35 +534,218 @@ It does NOT become a Telegram command.
 
 
 # =========================================================
-# CREATE
+# BATCH QUIZ CREATION PROCESSOR
 # =========================================================
 
-async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_quiz_creation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     uid = user_id(update)
     message = update.effective_message
 
-    if not uid or not message:
+    if not uid or not message or not message.text:
         return
 
-    DRAFTS[uid] = {
-        "state": STATE_TITLE,
-        "title": "",
-        "subject": "",
-        "question_count": 0,
-        "time_limit": 30,
-        "negative_marking": 0,
-        "questions": [],
-        "current_question": {},
-        "section_mode": False,
-        "sections": [],
-    }
+    draft = DRAFTS.get(uid)
 
-    await message.reply_text(
-        "<b>📝 CREATE NEW QUIZ</b>\n\n"
-        "Quiz का title भेजें.\n\n"
-        "आप बाद में /cancel से creation रोक सकते हैं।",
-        parse_mode="HTML",
-    )
+    if not draft:
+        return
+
+    text = message.text.strip()
+    state = draft["state"]
+
+    # =====================================================
+    # TITLE
+    # =====================================================
+
+    if state == STATE_TITLE:
+
+        if len(text) < 2:
+            await message.reply_text(
+                "❌ Quiz title थोड़ा बड़ा रखें."
+            )
+            return
+
+        draft["title"] = text
+        draft["state"] = STATE_SUBJECT
+
+        await message.reply_text(
+            "📚 <b>Subject</b> भेजें.\n\n"
+            "Subject केवल database metadata रहेगा.\n"
+            "Subject नहीं देना है तो <code>skip</code> लिखें.",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # SUBJECT
+    # =====================================================
+
+    if state == STATE_SUBJECT:
+
+        draft["subject"] = (
+            ""
+            if text.lower() == "skip"
+            else text
+        )
+
+        draft["state"] = STATE_TIME
+
+        await message.reply_text(
+            "⏱️ <b>Time Limit</b>\n\n"
+            "Quiz कितने minutes का होगा?\n\n"
+            "Example: <code>30</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # TIME
+    # =====================================================
+
+    if state == STATE_TIME:
+
+        try:
+            minutes = int(text)
+        except ValueError:
+            await message.reply_text(
+                "❌ केवल minutes की संख्या भेजें.\n"
+                "Example: 30"
+            )
+            return
+
+        if not 1 <= minutes <= 300:
+            await message.reply_text(
+                "❌ Time limit 1 से 300 minutes के बीच रखें."
+            )
+            return
+
+        draft["time_limit"] = minutes
+        draft["state"] = STATE_NEGATIVE
+
+        await message.reply_text(
+            "➖ <b>Negative Marking</b>\n\n"
+            "0 = No negative marking\n"
+            "0.25 = 1/4\n"
+            "0.33 = 1/3\n\n"
+            "Example: <code>0.25</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # NEGATIVE MARKING
+    # =====================================================
+
+    if state == STATE_NEGATIVE:
+
+        try:
+            negative = float(text)
+        except ValueError:
+            await message.reply_text(
+                "❌ Example: 0, 0.25 या 0.33"
+            )
+            return
+
+        if not 0 <= negative <= 1:
+            await message.reply_text(
+                "❌ Negative marking 0 से 1 के बीच रखें."
+            )
+            return
+
+        draft["negative_marking"] = negative
+        draft["state"] = "batch_questions"
+
+        await message.reply_text(
+            "📋 <b>अब सारे Questions एक साथ भेजें.</b>\n\n"
+            "Format:\n\n"
+            "<code>"
+            "Q1. Question text\n"
+            "A. Option A\n"
+            "B. Option B\n"
+            "C. Option C\n"
+            "D. Option D\n"
+            "Correct: B\n"
+            "Explanation: Explanation text\n\n"
+            "Q2. Question text\n"
+            "A. Option A\n"
+            "B. Option B\n"
+            "C. Option C\n"
+            "D. Option D\n"
+            "Correct: C\n"
+            "Explanation: Explanation text"
+            "</code>\n\n"
+            "💡 जितने questions भेजेंगे, "
+            "उतने ही quiz में add होंगे.\n\n"
+            "❌ रोकने के लिए /cancel",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # BATCH QUESTIONS
+    # =====================================================
+
+    if state == "batch_questions":
+
+        questions = parse_batch_questions(text)
+
+        if not questions:
+
+            await message.reply_text(
+                "❌ कोई valid question नहीं मिला.\n\n"
+                "कृपया format इस तरह रखें:\n\n"
+                "<code>"
+                "Q1. भारत की राजधानी क्या है?\n"
+                "A. पटना\n"
+                "B. दिल्ली\n"
+                "C. मुंबई\n"
+                "D. जयपुर\n"
+                "Correct: B\n"
+                "Explanation: नई दिल्ली भारत की राजधानी है."
+                "</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        draft["questions"] = questions
+        draft["question_count"] = len(questions)
+        draft["state"] = "complete"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "👁 Preview Quiz",
+                    callback_data="draft_preview",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💾 Save Quiz",
+                    callback_data="draft_save",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="draft_cancel",
+                )
+            ],
+        ])
+
+        await message.reply_text(
+            f"✅ <b>{len(questions)} questions detected!</b>\n\n"
+            f"Quiz: <b>{escape(draft['title'])}</b>\n"
+            f"Subject: "
+            f"<b>{escape(draft['subject'] or 'Not specified')}</b>\n"
+            f"Time: <b>{draft['time_limit']} minutes</b>\n"
+            f"Negative: <b>{draft['negative_marking']}</b>\n\n"
+            "अब Preview या Save Quiz चुनें.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
 
 
 # =========================================================
