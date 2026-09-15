@@ -1983,11 +1983,14 @@ def register_handlers(
     # -----------------------------------------------------
     # UNKNOWN COMMAND
     # -----------------------------------------------------
+    # IMPORTANT:
+    # Keep this in the SAME group as CommandHandlers.
+    # It must be registered AFTER all valid CommandHandlers.
 
     application.add_handler(
         MessageHandler(
             filters.COMMAND,
-            unknown_command,
-        ),
-        group=3,
+                unknown_command,
+       ),
+       group=0,
     )
